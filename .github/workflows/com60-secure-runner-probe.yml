@@ -1,0 +1,21 @@
+name: COM-60 secure runner probe
+
+on:
+  push:
+    branches:
+      - work/com60-secure-native-runner
+    paths:
+      - '.github/workflows/com60-secure-runner-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-2025
+    steps:
+      - name: Prove public Windows hosted runner availability
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          [pscustomobject]@{ok=$true;os=[System.Environment]::OSVersion.VersionString;machine=$env:RUNNER_NAME;run=$env:GITHUB_RUN_ID}|ConvertTo-Json
