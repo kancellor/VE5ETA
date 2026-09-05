@@ -1,0 +1,207 @@
+name: COM-60 secure native acceptance
+
+on:
+  push:
+    branches:
+      - work/com60-secure-native-runner
+    paths:
+      - '.github/workflows/com60-secure-native.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  native:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Generate one-run RSA handshake key
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $openssl='C:\Program Files\Git\usr\bin\openssl.exe'
+          if(-not(Test-Path -LiteralPath $openssl)){throw 'OpenSSL missing from hosted runner'}
+          New-Item -ItemType Directory -Force -Path handshake | Out-Null
+          & $openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out handshake/private.pem
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          & $openssl pkey -in handshake/private.pem -pubout -out handshake/public.pem
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          if(-not(Test-Path handshake/private.pem) -or -not(Test-Path handshake/public.pem)){throw 'RSA handshake generation failed'}
+
+      - name: Publish public encryption key only
+        uses: actions/upload-artifact@v4
+        with:
+          name: com60-secure-public-key-${{ github.run_id }}
+          retention-days: 1
+          path: handshake/public.pem
+
+      - name: Wait for encrypted private input
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $remote='refs/remotes/origin/com60secure'
+          $found=$false
+          for($attempt=1;$attempt -le 180;$attempt++){
+            git fetch origin '+refs/heads/work/com60-secure-native-runner:refs/remotes/origin/com60secure' --force --quiet
+            git cat-file -e "$remote`:secure-input/manifest.json" 2>$null
+            $hasManifest=($LASTEXITCODE -eq 0)
+            git cat-file -e "$remote`:secure-input/key.enc" 2>$null
+            $hasKey=($LASTEXITCODE -eq 0)
+            git cat-file -e "$remote`:secure-input/payload.enc" 2>$null
+            $hasPayload=($LASTEXITCODE -eq 0)
+            if($hasManifest -and $hasKey -and $hasPayload){
+              if(Test-Path secure-input){Remove-Item secure-input -Recurse -Force}
+              git checkout $remote -- secure-input
+              if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+              $found=$true
+              Write-Host "Encrypted input received after poll $attempt"
+              break
+            }
+            Start-Sleep -Seconds 10
+          }
+          if(-not $found){throw 'Timed out waiting for encrypted COM-60 input'}
+
+      - name: Decrypt candidate inside ephemeral runner
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $openssl='C:\Program Files\Git\usr\bin\openssl.exe'
+          New-Item -ItemType Directory -Force -Path secure-work/payload | Out-Null
+          & $openssl pkeyutl -decrypt -inkey handshake/private.pem -in secure-input/key.enc -out handshake/pass.bin -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          & $openssl enc -d -aes-256-cbc -pbkdf2 -in secure-input/payload.enc -out secure-work/payload.zip -pass file:handshake/pass.bin
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          Expand-Archive -LiteralPath secure-work/payload.zip -DestinationPath secure-work/payload -Force
+          $manifest=Get-Content secure-input/manifest.json -Raw|ConvertFrom-Json
+          $candidate='secure-work/payload/candidate.pbix'
+          if(-not(Test-Path -LiteralPath $candidate)){throw 'decrypted candidate.pbix missing'}
+          $sha=(Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($sha -ne [string]$manifest.candidate_pbix_sha256){throw "candidate SHA mismatch: $sha"}
+          if([int]$manifest.expected_page_count -ne 14 -or [int]$manifest.expected_visual_count -ne 668){throw 'unexpected acceptance inventory contract'}
+          "COM60_PRODUCT_SHA=$sha" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "COM60_SOURCE_INTEGRATION=$($manifest.source_integration_commit)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "COM60_FINAL_BRANCH_COMMIT=$($manifest.final_refinement_commit)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "COM60_LOVABLE_HEAD=$($manifest.lovable_latest_commit_sha)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Discover every page and create render-only variants
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force -Path secure-output/plain/evidence | Out-Null
+          python com60-secure-runner/render_variants.py --candidate secure-work/payload/candidate.pbix --output-dir secure-work/variants --inventory secure-output/plain/evidence/inventory.json
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          $inventory=Get-Content secure-output/plain/evidence/inventory.json -Raw|ConvertFrom-Json
+          if(-not $inventory.ok -or [int]$inventory.page_count -ne 14 -or [int]$inventory.total_visuals -ne 668){throw 'PBIX inventory gate failed'}
+          if([string]$inventory.candidate_pbix_sha256 -ne $env:COM60_PRODUCT_SHA){throw 'inventory candidate SHA mismatch'}
+
+      - name: Install registered Power BI Desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          Invoke-WebRequest -Uri 'https://download.microsoft.com/download/8/8/0/880bca75-79dd-466a-927d-1abf1f5454b0/PBIDesktopSetup_x64.exe' -OutFile PBIDesktopSetup_x64.exe
+          $proc=Start-Process -FilePath (Resolve-Path 'PBIDesktopSetup_x64.exe').Path -ArgumentList @('-quiet','-norestart','ACCEPT_EULA=1','DISABLE_UPDATE_NOTIFICATION=1','INSTALLDESKTOPSHORTCUT=0','LANGUAGE=en-US') -Wait -PassThru
+          if($proc.ExitCode -notin @(0,3010)){throw "Power BI Desktop install failed: $($proc.ExitCode)"}
+          $desktop=$null
+          foreach($path in @('C:\Program Files\Microsoft Power BI Desktop\bin\PBIDesktop.exe','C:\Program Files (x86)\Microsoft Power BI Desktop\bin\PBIDesktop.exe')){
+            if(Test-Path -LiteralPath $path){$desktop=(Get-Item -LiteralPath $path).FullName;break}
+          }
+          if(-not $desktop){$desktop=(Get-ChildItem 'C:\Program Files' -Recurse -Filter PBIDesktop.exe -ErrorAction SilentlyContinue|Select-Object -First 1).FullName}
+          if(-not $desktop){throw 'registered PBIDesktop.exe missing'}
+          "COM60_DESKTOP=$desktop" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          [pscustomobject]@{ok=$true;desktop=$desktop;installer_exit_code=$proc.ExitCode}|ConvertTo-Json|Set-Content -Encoding utf8 secure-output/plain/evidence/desktop-install.json
+
+      - name: Set exact native 1920x1080 display
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          Add-Type -AssemblyName System.Windows.Forms
+          Set-DisplayResolution -Width 1920 -Height 1080 -Force
+          Start-Sleep -Seconds 2
+          $screen=[System.Windows.Forms.SystemInformation]::VirtualScreen
+          if($screen.Width -ne 1920 -or $screen.Height -ne 1080){throw "display remained $($screen.Width)x$($screen.Height)"}
+          [pscustomobject]@{width=$screen.Width;height=$screen.Height}|ConvertTo-Json|Set-Content -Encoding utf8 secure-output/plain/evidence/display.json
+
+      - name: Native Power BI Desktop capture of every discovered page
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $inventory=Get-Content secure-output/plain/evidence/inventory.json -Raw|ConvertFrom-Json
+          foreach($page in @($inventory.pages | Sort-Object index)){
+            $env:COM60_CANDIDATE=(Resolve-Path -LiteralPath ("secure-work/variants/{0}.pbix" -f $page.label)).Path
+            $env:COM60_LABEL=[string]$page.label
+            $env:COM60_PAGE_NAME=[string]$page.display_name
+            Write-Host ("Capturing page index={0} label={1}" -f $page.index,$page.label)
+            & com60-secure-runner/capture.ps1
+            if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+            $ePath=("secure-output/plain/evidence/page-{0}.json" -f $page.label)
+            $e=Get-Content $ePath -Raw|ConvertFrom-Json
+            $e | Add-Member -NotePropertyName index -NotePropertyValue ([int]$page.index) -Force
+            $e | Add-Member -NotePropertyName visual_count -NotePropertyValue ([int]$page.visual_count) -Force
+            $e | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8 $ePath
+          }
+
+      - name: Verify complete native set
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $screens=@(Get-ChildItem secure-output/plain/screenshots -Filter '*.png')
+          $pages=@(Get-ChildItem secure-output/plain/evidence -Filter 'page-*.json')
+          if($screens.Count -ne 14){throw "expected 14 screenshots, found $($screens.Count)"}
+          if($pages.Count -ne 14){throw "expected 14 page evidence files, found $($pages.Count)"}
+          $rows=@($pages|ForEach-Object{Get-Content $_.FullName -Raw|ConvertFrom-Json})|Sort-Object index
+          foreach($row in $rows){
+            if(-not $row.ok -or -not $row.stable_dialog_free -or -not $row.modal_rejected -or -not $row.teaching_overlays_rejected -or -not $row.canvas_stable){throw "unclean native evidence for $($row.page)"}
+            if($row.candidate_pbix_sha256 -ne $env:COM60_PRODUCT_SHA){throw "candidate identity mismatch for $($row.page)"}
+            if([int]$row.native_width -ne 1920 -or [int]$row.native_height -ne 1080){throw "wrong native resolution for $($row.page)"}
+          }
+          $visuals=($rows|Measure-Object visual_count -Sum).Sum
+          if([int]$visuals -ne 668){throw "expected 668 visuals, got $visuals"}
+          $unique=@($rows|ForEach-Object{$_.screenshot_sha256}|Select-Object -Unique)
+          if($unique.Count -ne 14){throw 'duplicate screenshots detected'}
+          Copy-Item -LiteralPath secure-work/payload/candidate.pbix -Destination 'secure-output/plain/COM Academic Insight - COM60 Final Visual Acceptance.pbix'
+          Copy-Item -LiteralPath secure-input/manifest.json -Destination secure-output/plain/evidence/input-manifest.json
+          [pscustomobject]@{
+            ok=$true
+            source_integration_commit=$env:COM60_SOURCE_INTEGRATION
+            final_refinement_commit=$env:COM60_FINAL_BRANCH_COMMIT
+            candidate_pbix_sha256=$env:COM60_PRODUCT_SHA
+            lovable_latest_commit_sha=$env:COM60_LOVABLE_HEAD
+            native_acceptance_run_id=$env:GITHUB_RUN_ID
+            page_count=14
+            total_visuals=668
+            pages=$rows
+          }|ConvertTo-Json -Depth 8|Set-Content -Encoding utf8 secure-output/plain/evidence/native-acceptance-identity.json
+
+      - name: Encrypt all private output before artifact upload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $openssl='C:\Program Files\Git\usr\bin\openssl.exe'
+          Compress-Archive -Path secure-output/plain/* -DestinationPath secure-output/com60-output.zip -Force -CompressionLevel Optimal
+          & $openssl enc -aes-256-cbc -salt -pbkdf2 -in secure-output/com60-output.zip -out secure-output/com60-output.enc -pass file:handshake/pass.bin
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          $encryptedSha=(Get-FileHash -LiteralPath secure-output/com60-output.enc -Algorithm SHA256).Hash.ToLowerInvariant()
+          [pscustomobject]@{ok=$true;encrypted_output_sha256=$encryptedSha;run_id=$env:GITHUB_RUN_ID;cipher='AES-256-CBC';kdf='PBKDF2'}|ConvertTo-Json|Set-Content -Encoding utf8 secure-output/output-manifest.json
+          Remove-Item secure-output/plain -Recurse -Force
+          Remove-Item secure-output/com60-output.zip -Force
+          Remove-Item secure-work -Recurse -Force
+          Remove-Item handshake/private.pem,handshake/pass.bin -Force
+          if(Test-Path secure-input){Remove-Item secure-input -Recurse -Force}
+
+      - name: Upload encrypted acceptance set only
+        uses: actions/upload-artifact@v4
+        with:
+          name: com60-secure-native-output-${{ github.run_id }}
+          retention-days: 1
+          path: |
+            secure-output/com60-output.enc
+            secure-output/output-manifest.json
